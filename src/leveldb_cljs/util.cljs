@@ -161,3 +161,84 @@
   "True when `e` reports use of a closed database/iterator/batch/snapshot."
   [e]
   (contains? not-open-codes (error-code e)))
+
+;; ---------------------------------------------------------------------------
+;; Phase 2 additions (inventory §11.7): option-key normalisation, per-method
+;; option whitelists, range-option normalisation, batch-op normalisation.
+;; ---------------------------------------------------------------------------
+
+(defn strip-question-mark
+  "`:create-if-missing?` -> :create-if-missing. Keywords keep their
+   namespace; anything that is not a keyword is returned unchanged. Lets
+   boolean options be spelled with the idiomatic `?` suffix while the
+   upstream camelCase name stays `createIfMissing`."
+  [k]
+  (if (keyword? k)
+    (keyword (namespace k) (str/replace (name k) #"\?$" ""))
+    k))
+
+(defn normalize-opts
+  "Strips the `?` suffix from every top-level keyword key of `opts` and
+   drops nil-valued entries. nil -> {}."
+  [opts]
+  (into {}
+        (keep (fn [[k v]] (when (some? v) [(strip-question-mark k) v])))
+        opts))
+
+(defn check-opts!
+  "Throws an argument-error when `opts` (already normalised) is not a map or
+   contains a key outside `allowed` (a set of kebab keywords without `?`).
+   Returns `opts`. Pitfall 8.17: upstream silently ignores unknown keys."
+  [op allowed opts]
+  (when-not (map? opts)
+    (throw (argument-error (str (name op) ": options must be a map")
+                           {:arg :opts :value opts :op op})))
+  (let [unknown (remove allowed (keys opts))]
+    (when (seq unknown)
+      (throw (argument-error (str (name op) ": unknown option(s) " (pr-str (vec unknown))
+                                  "; allowed: " (pr-str (vec (sort allowed))))
+                             {:arg :opts :unknown (set unknown) :allowed allowed :op op}))))
+  opts)
+
+(def range-keys
+  "The four range bounds accepted by iterators and clear!."
+  #{:gt :gte :lt :lte})
+
+(defn check-limit!
+  "Validates `:limit` (inventory 5.4): nil -> unlimited (dropped), -1 ->
+   unlimited, 0 -> nothing, positive integer -> that many; anything else is
+   an argument-error. Returns the normalised opts."
+  [op opts]
+  (let [limit (:limit opts)]
+    (cond
+      (nil? limit) (dissoc opts :limit)
+      (and (integer? limit) (or (= -1 limit) (>= limit 0))) opts
+      :else (throw (argument-error (str (name op) ": :limit must be nil, -1 or a non-negative integer")
+                                   {:arg :limit :value limit :op op})))))
+
+(defn valid-op-type?
+  "True for :put / :del."
+  [t]
+  (contains? #{:put :del} t))
+
+(defn normalize-op
+  "Validates the shape of one batch operation map (pitfall 8.1/8.19):
+   :type must be :put or :del, :key must be present, :put needs :value, only
+   the keys #{:type :key :value :key-encoding :value-encoding :sublevel} are
+   allowed. Returns the op (with `?`-less keys). Throws argument-error.
+   Sublevel root identity and encoding are checked by core, which knows the
+   client structure."
+  [idx op]
+  (when-not (map? op)
+    (throw (argument-error (str "batch op " idx " must be a map") {:arg :ops :index idx :value op})))
+  (let [op (normalize-opts op)
+        t (:type op)]
+    (when-not (valid-op-type? t)
+      (throw (argument-error (str "batch op " idx ": :type must be :put or :del")
+                             {:arg :ops :index idx :value t})))
+    (when-not (contains? op :key)
+      (throw (argument-error (str "batch op " idx ": missing :key") {:arg :ops :index idx})))
+    (when (and (= :put t) (not (contains? op :value)))
+      (throw (argument-error (str "batch op " idx ": :put needs a :value") {:arg :ops :index idx})))
+    (check-opts! :batch #{:type :key :value :key-encoding :value-encoding :sublevel} op)
+    op))

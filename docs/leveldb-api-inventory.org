@@ -506,11 +506,12 @@ values. Positions are in 4.7 and 10.3.
 | Keyword     | Upstream encoding | Read result in CLJS                           | Notes                                                              |
 |-------------+-------------------+-----------------------------------------------+--------------------------------------------------------------------|
 | =:utf8=     | ='utf8'=          | string                                        | default (matches upstream); library rejects non-string values with argument-error instead of letting utf8 stringify them (pitfall 8.4) |
-| =:json=     | ='json'=          | keywordized CLJS data (binding does =clj->js= before write and =js->clj :keywordize-keys= after read) | lossy for keywords/sets/non-string map keys; keys become keywords on read |
+| =:json=     | ='utf8'= + library-side =JSON.stringify= / =JSON.parse= (11.8) | keywordized CLJS data (=clj->js= before write, =js->clj :keywordize-keys= after read) | lossy for keywords/sets/non-string map keys; keys become keywords on read; same bytes as upstream ='json'=, decode failures are codec-errors |
 | =:edn=      | ='utf8'= + library-side =pr-str= / =cljs.reader/read-string= | exact CLJS data | RECOMMENDED for CLJS values; no npm dependency; EDN-only reader (no =#=()= eval); uncertainty 9.12 |
 | =:buffer=   | ='buffer'=        | opaque Buffer                                 | passed through untouched; helpers in the binding ns (10.3)          |
 | =:view=     | ='view'=          | opaque Uint8Array                             | same                                                               |
-| =:hex= / =:base64= | ='hex'= / ='base64'= | string                                | the CLJS-friendly way to store binary without touching buffers      |
+| =:hex= / =:base64= | ='hex'= / ='base64'= | string                                | the CLJS-friendly way to store binary without touching buffers; the string is validated before upstream sees it |
+| =:raw=      | ='buffer'=        | opaque Buffer                                 | pre-encoded string or bytes pass through untouched (11.8)          |
 | ={:name .. :format .. :encode .. :decode ..}= | custom object built by the binding | whatever =decode= returns | =:format= ∈ =#{:utf8 :buffer :view}=; functions receive/return strings for =:utf8= |
 Transit was considered and rejected: =transit-cljs= needs the =transit-js= npm package,
 violating the zero-extra-runtime-deps rule. Keys default to =:utf8=; the same keyword
@@ -872,6 +873,50 @@ and return promesa promises unless marked (sync). Names ending in =!= perform I/
 ** 11.7 =leveldb-cljs.util= — Phase 0 (done): case translation, code translation, errors.
 Phase 2 additions: per-method option whitelists, =range-opts= normalization (nil
 dropping, =:limit= validation), =normalize-op= for batch ops.
+
+** 11.8 Implementation record (Phase 2+3, 2026-09-25)
+Delivered as =src/leveldb_cljs/{core,codec,iter}.cljs= (+ Phase 2 helpers appended to
+=util=). Deviations from the outline above, each with the reason:
+- *=binding= and =batch= are folded into =core=.* The task directive made =core= the single
+  interop namespace; a separate =batch= namespace would have been a pure re-export.
+  Chained batches are =core/chained-batch=, =batch-put!=, =batch-del!=, =batch-clear!=,
+  =batch-length=, =batch-write!=, =batch-close!=, =with-batch!=. Upstream methods are
+  called with =js-invoke= (no =^js= hints; Closure's default externs only know some
+  method names, the rest would emit infer warnings).
+- *Manual iterator handles live in =core=* (=iterator=, =key-iterator=, =value-iterator=,
+  =it-next!=, =it-nextv!=, =it-all!=, =it-seek!=, =it-close!=, =it-count=, =it-open?=)
+  because =iter= may not do interop; =iter= adds the channels, =collect!=, =reduce!=,
+  =entries-seq!=, =keys-seq!=, =values-seq!=, =error?=.
+- *Silent-stringify guard raises =:leveldb-cljs/codec-error=* (11.2 said argument-error):
+  the task fixed the type. =nil= keys/values stay argument-errors.
+- *=:json= is library-side* (=clj->js= + =JSON.stringify= on write, =JSON.parse= +
+  =js->clj :keywordize-keys= on read, upstream ='utf8'=) instead of upstream ='json'=
+  (4.7): identical bytes on disk, and decode failures become codec-errors with the raw
+  text instead of =LEVEL_DECODE_ERROR=. Section 4.7's row for =:json= should be read
+  accordingly.
+- *=:raw= codec added*: pre-encoded string or bytes pass through untouched (upstream
+  ='buffer'=), reads yield the stored bytes.
+- *Sublevel clients inherit the parent's codecs* (upstream resets to utf8/utf8, 2.7);
+  every call passes the codec's upstream encoding explicitly, so the upstream default
+  never applies. =:key-encoding= / =:value-encoding= on =sublevel= still override.
+- *Sublevel handle re-derivation* keys on both the root's open generation and the
+  parent's handle identity, so =close!= + =open!= of a sublevel client refreshes its
+  descendants too. =open!= on an already-open root does not bump the generation.
+- *=open!= option names*: =:path= (alias =:location=), =:memory?= (instead of
+  =:backend :memory=), boolean options accept a =?= suffix (=:create-if-missing?=)
+  which =util/normalize-opts= strips before the camelCase translation.
+- *=has!= keeps the outline name* (the task summary wrote =has?=); =get-sync= is exposed
+  with the blocking caveat in its docstring (9.15).
+- *=core/open-resources=* counts open iterator/snapshot/batch handles per root (the
+  tests use it to prove channel close releases the upstream iterator).
+- *Channel cancellation*: core.async =close!= does not wake a parked put, so the producer
+  parks with =alts!= against a 100 ms timeout and re-checks =closed?= (10.4 assumed
+  =>!= would return false). The upstream iterator is closed BEFORE the channel closes.
+- *Events channel* (=iter/events=) not delivered in Phase 3; moved to Phase 4 with
+  =admin=.
+- Verified while implementing: =cljs.reader/read-string= returns =nil= (not the =:eof=
+  sentinel) for the empty string, so the =:edn= codec treats ="" = as a decode error
+  explicitly; the EDN reader reads the first form only (trailing text is ignored).
 
 * 12. Sources
 ** npm registry (=npm view=, 2026-09-25)

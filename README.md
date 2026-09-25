@@ -15,7 +15,9 @@ is a devDependency so the tests never touch the disk or the network.
 ## Hard style rules (non-negotiable)
 
 - ClojureScript only at every call site: **no `^js` type hints, no JavaScript
-  interop outside the single binding namespace** (`leveldb-cljs.binding`, Phase 2).
+  interop outside the single binding namespace** (`leveldb-cljs.core`, which is
+  both the binding and the client; `codec` only calls `JSON.stringify`/`parse`,
+  `iter` is core.async over `core` handles).
 - Kebab-case keyword maps in and out (`:key-encoding`, `:create-if-missing`,
   `:implicit-snapshots`); upstream camelCase never leaks.
 - Async operations return promesa promises; iterators and events are core.async
@@ -31,12 +33,14 @@ is a devDependency so the tests never touch the disk or the network.
 |-------|---------|-------|
 | 0 | scaffold: shadow-cljs `:node-test` / `:dev` builds, `run-tests.sh`, `util` (case + error-code translation, error constructors) | done |
 | 1 | API inventory (`docs/leveldb-api-inventory.org`): package choice, API census, error taxonomy, encodings, iterator/batch/snapshot subtleties, pitfalls, uncertainties, Phase 2 outline | done |
-| 2 | `binding` (the only interop namespace), `codec` (`:utf8 :json :edn :buffer :view :hex :base64` + custom), `core` (open!/close!, get!/put!/del!/batch!/clear!, sublevels, snapshots), `batch` (chained batches) | pending |
-| 3 | `iter` (core.async entries/keys/values channels, manual iterator handles, `events` channel) | pending |
+| 2 | `core` (the only interop namespace + client: open!/close!/status/supports, get!/get-sync/get-many!/has!/has-many!, put!/del!/batch!/clear!, chained batches, sublevels with reopen re-derivation + root-identity checks, snapshots, iterator handles, bytes helpers), `codec` (`:utf8 :json :edn :hex :base64 :buffer :view :raw` + custom maps; codec discipline) | done |
+| 3 | `iter` (core.async `entries!`/`keys!`/`values!` channels with backpressure and close-to-cancel, `collect!`/`reduce!`/`entries-seq!`); `events` channel deferred to Phase 4 | done |
 | 4 | `admin` (approximate-size!, compact-range!, property, destroy!, repair!) | pending |
 | 5 | live smoke on a temporary on-disk `classic-level` database (lock, create-if-missing, error-if-exists shapes; platform/prebuild report) | pending |
 
-`./run-tests.sh` — 6 tests / 52 assertions (Phase 0), no disk, no network.
+`./run-tests.sh` — 61 tests / 806 assertions (Phases 0–3): memory-level in-process
+plus a temporary on-disk `level` database per test (created under the OS temp dir and
+removed afterwards), no network.
 
 ## Upstream facts that shape the design (see the inventory)
 
@@ -50,21 +54,36 @@ is a devDependency so the tests never touch the disk or the network.
 - Test backend: `memory-level@3.1.0` (`memdown` is deprecated, `memorydown` does not
   exist).
 
-## Quick start (target API, Phase 2)
+## Quick start
 
 ```clojure
 (require '[leveldb-cljs.core :as db]
+         '[leveldb-cljs.iter :as iter]
+         '[cljs.core.async :as async :refer [<! go-loop]]
          '[promesa.core :as p])
 
-(p/let [c (db/open! {:location "./data" :value-encoding :edn})]
-  (p/let [_ (db/put! c "alice" {:score 620})
-          v (db/get! c "alice")            ; {:score 620}
-          _ (db/batch! c [{:type :put :key "bob" :value {:score 10}}
-                          {:type :del :key "carol"}])
-          ks (db/keys! c {:gte "a" :lt "c" :limit 10})]
-    (println v ks)
-    (db/close! c)))
+(p/let [c (db/open! {:path "./data" :value-encoding :edn})   ; awaits open
+        _ (db/put! c "alice" {:score 620})
+        v (db/get! c "alice")                                ; {:score 620}; nil when absent
+        _ (db/batch! c [{:type :put :key "bob" :value {:score 10}}
+                        {:type :del :key "carol"}])
+        ks (db/keys! c {:gte "a" :lt "c" :limit 10})         ; vector
+        people (db/sublevel c "people")                      ; namespaced keys, same codecs
+        _ (db/put! people "dana" {:score 1})]
+  (println v ks)
+  (let [ch (iter/entries! c {:gte "a"})]                     ; lazy, backpressured channel
+    (go-loop []
+      (when-some [{:keys [key value] :as item} (<! ch)]
+        (if (iter/error? item) (println "failed:" (ex-message item)) (println key value))
+        (recur))))
+  (db/close! c))
 ```
+
+Errors: every rejection is an `ex-info` — check `(db/error-code e)` (`:database-not-open`,
+`:locked`, `:iterator-busy` …), `(db/error-type e)` or `(db/not-open? e)`. `get-sync`
+blocks the event loop (documented); `clear!` is not atomic (upstream). Closing a
+channel from `iter` cancels and releases the upstream iterator; `db/open-resources`
+reports still-open iterators/snapshots/batches.
 
 ## Development
 
