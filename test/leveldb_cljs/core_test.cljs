@@ -834,8 +834,8 @@
                   _ (core/close! c)
                   after (core/open-resources c)
                   e (tu/rejection (core/it-next! _it))]
-            (is (= {:iterators 1 :snapshots 1 :batches 1} before))
-            (is (= {:iterators 0 :snapshots 0 :batches 0} after) "close! sweeps everything")
+            (is (= {:iterators 1 :snapshots 1 :batches 1 :subscriptions 0} before))
+            (is (= {:iterators 0 :snapshots 0 :batches 0 :subscriptions 0} after) "close! sweeps everything")
             (is (util/not-open? e))))))))
 
 (deftest non-client-arguments-are-argument-errors

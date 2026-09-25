@@ -25,4 +25,11 @@
   :dev {:target :node-script
         :main leveldb-cljs.dev/main
         :output-to "target/dev.js"
-        :devtools {:enabled true}}}}
+        :devtools {:enabled true}}
+
+  ;; Phase 4 live smoke: a REAL on-disk classic-level database in a fresh directory
+  ;; under the OS temp dir (removed afterwards) next to a memory-level one. No network.
+  ;;   npx shadow-cljs compile smoke && node target/smoke.js
+  :smoke {:target :node-script
+          :main leveldb-cljs.smoke/main
+          :output-to "target/smoke.js"}}}

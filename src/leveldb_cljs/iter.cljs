@@ -24,8 +24,7 @@
    is busy whenever a read is in flight and `seek` then throws
    :iterator-busy (inventory 5.1); use core/iterator + core/it-seek! for
    manual positioning."
-  (:require [cljs.core.async :as async :refer [<! alts! go-loop]]
-            [cljs.core.async.impl.protocols :as impl]
+  (:require [cljs.core.async :as async :refer [<! go-loop]]
             [promesa.core :as p]
             [leveldb-cljs.core :as core]
             [leveldb-cljs.util :as util]))
@@ -40,8 +39,9 @@
 
 (def cancel-poll-ms
   "How long a parked put waits before re-checking whether the consumer
-   closed the channel (a closed channel does not wake parked puts)."
-  100)
+   closed the channel (a closed channel does not wake parked puts). Shared
+   with the events channel of leveldb-cljs.core (util/cancel-poll-ms)."
+  util/cancel-poll-ms)
 
 (def channel-options
   "Options of the channel producers besides the core iterator options."
@@ -62,16 +62,7 @@
         (p/catch (fn [e] (async/put! ch [:error e]))))
     ch))
 
-(defn- put-or-cancel!
-  "Puts `v` on `ch`; returns a channel yielding true when delivered, false
-   when the consumer closed `ch` (checked on every poll tick)."
-  [ch v]
-  (go-loop []
-    (let [[res port] (alts! [[ch v] (async/timeout cancel-poll-ms)])]
-      (cond
-        (identical? port ch) (boolean res)
-        (impl/closed? ch) false
-        :else (recur)))))
+(def ^:private put-or-cancel! util/put-or-cancel!)
 
 (defn- put-all!
   "Puts every item of `items`; yields false as soon as the consumer closed."

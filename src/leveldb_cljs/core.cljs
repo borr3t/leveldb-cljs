@@ -5,7 +5,8 @@
    kebab-case keyword maps, promesa promises for every I/O operation,
    opaque record handles for databases, iterators, chained batches and
    snapshots. leveldb-cljs.iter builds core.async channels on top of the
-   iterator handles defined here.
+   iterator handles defined here; the events channel (`events!`, inventory
+   §6) lives in this namespace because subscribing is interop.
 
    Conventions (inventory §11):
    - names ending in `!` perform I/O and return a promise, except the
@@ -33,6 +34,7 @@
    sublevel handles stay closed forever after a parent close, inventory
    9.13)."
   (:require [clojure.string :as str]
+            [cljs.core.async :as async :refer [<! alts! go-loop]]
             [promesa.core :as p]
             [leveldb-cljs.codec :as codec]
             [leveldb-cljs.util :as util]))
@@ -277,7 +279,8 @@
     :memory (unchecked-get (js/require "memory-level") "MemoryLevel")
     :level (unchecked-get (js/require "level") "Level")))
 
-(def ^:private track-keys {:iterator :iterators :snapshot :snapshots :batch :batches})
+(def ^:private track-keys
+  {:iterator :iterators :snapshot :snapshots :batch :batches :subscription :subscriptions})
 
 (defn- track! [c kind handle]
   (swap! (:state (root c)) update (track-keys kind) (fnil conj #{}) handle)
@@ -288,16 +291,19 @@
   handle)
 
 (defn open-resources
-  "Counts of the iterator / snapshot / chained-batch handles created through
-   this client's root that have not been closed yet:
-   {:iterators n :snapshots n :batches n}. Useful to prove that a cancelled
-   iterator channel released its upstream iterator."
+  "Counts of the iterator / snapshot / chained-batch handles and events!
+   subscriptions created through this client's root that have not been
+   closed / released yet: {:iterators n :snapshots n :batches n
+   :subscriptions n}. Useful to prove that a cancelled iterator channel
+   released its upstream iterator, or that a closed events channel removed
+   its upstream listeners."
   [c]
   (check-client! :open-resources c)
   (let [s @(:state (root c))]
     {:iterators (count (:iterators s))
      :snapshots (count (:snapshots s))
-     :batches (count (:batches s))}))
+     :batches (count (:batches s))
+     :subscriptions (count (:subscriptions s))}))
 
 (defn- open-new!
   [opts]
@@ -316,7 +322,8 @@
                  db (if (= :memory backend) (new ctor ctor-opts) (new ctor path ctor-opts))
                  client (->Client :root nil nil nil nil kc vc
                                   (atom {:db db :generation 0 :location path :backend backend
-                                         :iterators #{} :snapshots #{} :batches #{}}))]
+                                         :iterators #{} :snapshots #{} :batches #{}
+                                         :subscriptions #{}}))]
              (p/then (js-invoke db "open")
                      (fn [_]
                        (swap! (:state client) update :generation inc)
@@ -973,6 +980,189 @@
   "Promise of a vector of values for the range (value-iterator opts)."
   [c & [opts]]
   (run :values (fn [] (it-all! (value-iterator c opts)))))
+
+;; ---------------------------------------------------------------------------
+;; events (inventory §6): the upstream EventEmitter surface as a core.async
+;; channel. abstract-level 3 emits opening / open / closing / closed (no
+;; args), write (an array of normalized ops: put / del / batch / chained
+;; write) and clear (the options object); the legacy put / del / batch
+;; events are gone upstream (they warn LEVEL_LEGACY and never fire), so
+;; leveldb-cljs DERIVES :put / :del / :batch from `write`.
+;; ---------------------------------------------------------------------------
+
+(def event-names
+  "Every :event keyword an events! channel can deliver."
+  #{:opening :open :closing :closed :put :del :batch :clear})
+
+(def events-options
+  "Options of events!: :buffer (channel buffer size, default 32) and :only
+   (a set of event-names to deliver; the others are dropped)."
+  #{:buffer :only})
+
+(def ^:private upstream-events ["opening" "open" "closing" "closed" "write" "clear"])
+
+(defn- event-decode
+  "Decodes a raw key / value / bound from an upstream event payload with the
+   client's codec. Upstream hands back the ORIGINAL input of the write (a
+   string for the utf8-format codecs, bytes for the buffer ones), except
+   that writes made through a sublevel reach the parent already prefixed
+   and encoded (bytes on memory-level, strings on classic-level, pitfall
+   8.15): bytes are turned into text for a utf8-format codec so both
+   backends report the same thing. Returns [value decode-error]; a decode
+   failure (a sublevel's non-EDN text under an :edn root, for instance)
+   yields the raw value plus the codec-error instead of killing the
+   subscription."
+  [codec raw role]
+  (let [raw (undefined->nil raw)
+        raw (if (and (= :utf8 (:format codec)) (codec/bytes? raw))
+              (.toString (js/Buffer.from raw) "utf8")
+              raw)]
+    (try
+      [(codec/decode codec raw role) nil]
+      (catch :default e
+        [raw e]))))
+
+(defn- with-decoded
+  "assoc's `k` (decoded) onto event map `m`, recording a decode failure
+   under :decode-error."
+  [m k codec raw role]
+  (let [[v err] (event-decode codec raw role)]
+    (cond-> (assoc m k v)
+      (some? err) (assoc :decode-error err))))
+
+(defn- write-op->map
+  "One upstream write op -> {:type :put/:del :key k [:value v] [:sublevel true]}.
+   Upstream nulls op.sublevel before emitting (abstract-level.js 'Only
+   prefix once'), so a routed op is recognizable only by the presence of
+   the property: :sublevel true, with the prefixed key."
+  [c op]
+  (let [t (keyword (js-prop op "type"))
+        routed? (js-in "sublevel" op)
+        m (cond-> {:type t}
+            routed? (assoc :sublevel true))
+        m (with-decoded m :key (:key-codec c) (js-prop op "key") :key)]
+    (if (= :put t)
+      (with-decoded m :value (:value-codec c) (js-prop op "value") :value)
+      m)))
+
+(defn- write->event
+  "An upstream `write` payload (array of ops) -> one leveldb-cljs event: a
+   single op becomes {:event :put/:del ...} (upstream cannot tell a one-op
+   batch! from a put!), several become {:event :batch :ops [...]}."
+  [c ops]
+  (let [ms (mapv #(write-op->map c %) (array-seq ops))]
+    (if (= 1 (count ms))
+      (let [{:keys [type] :as m} (first ms)]
+        (assoc (dissoc m :type) :event type))
+      {:event :batch :ops ms})))
+
+(defn- clear->event
+  "An upstream `clear` payload (the verbatim options object) ->
+   {:event :clear [:gt/:gte/:lt/:lte decoded bounds] [:limit] [:reverse]}."
+  [c jo]
+  (let [opts (util/->kebab-keys (js->clj (or jo #js {})))
+        kc (:key-codec c)]
+    (reduce (fn [m [k v]]
+              (cond
+                (contains? util/range-keys k) (with-decoded m k kc v :key)
+                (contains? #{:limit :reverse} k) (assoc m k v)
+                :else m))
+            {:event :clear}
+            opts)))
+
+(defn- events-loop!
+  "Drains `queue` (a PersistentQueue in an atom, filled synchronously by the
+   upstream listeners so order is preserved) into `ch`. Cancel-poll
+   pattern: while idle it re-checks every util/cancel-poll-ms whether the
+   consumer closed `ch`; a parked put does the same through
+   util/put-or-cancel!. `release!` removes the upstream listeners exactly
+   once; :closed is always the last event delivered."
+  [ch queue signal only release!]
+  (go-loop []
+    (if-some [ev (peek @queue)]
+      (do (swap! queue pop)
+          (let [deliver? (or (nil? only) (contains? only (:event ev)))
+                closed-ev? (= :closed (:event ev))
+                ok? (if deliver? (<! (util/put-or-cancel! ch ev)) true)]
+            (cond
+              (not ok?) (release!)
+              closed-ev? (do (release!) (async/close! ch))
+              :else (recur))))
+      (do (alts! [signal (async/timeout util/cancel-poll-ms)])
+          (if (util/chan-closed? ch)
+            (release!)
+            (recur))))))
+
+(defn events!
+  "A core.async channel of the client's upstream events (inventory §6), in
+   emission order:
+     {:event :opening} {:event :open} {:event :closing} {:event :closed}
+     {:event :put :key k :value v [:sublevel true]}
+     {:event :del :key k [:sublevel true]}
+     {:event :batch :ops [{:type :put :key k :value v} {:type :del :key k} ..]}
+     {:event :clear [:gt/:gte/:lt/:lte bound] [:limit n] [:reverse b]}
+   :put / :del / :batch are derived from the upstream `write` event (the
+   legacy put/del/batch events no longer exist upstream): a one-op write
+   (put!, del!, a one-op batch!) is :put / :del, more ops are :batch.
+   Keys, values and bounds are decoded with the CLIENT'S codecs (per-call
+   codec overrides are not visible to the event side; a value written with
+   an override arrives as the client's codec reads its stored text);
+   :sublevel true marks an op routed with the :sublevel batch option (its
+   :key is then the prefixed key; upstream drops the sublevel reference
+   before emitting, so the prefix itself is only recoverable from the key).
+   Writes through a sublevel client also reach the parent's channel with
+   the prefixed key and the raw stored value (pitfall 8.10); subscribe on
+   the sublevel client to see its own keys. A decode failure adds
+   :decode-error (the ex-info) and keeps the raw value.
+   Subscribing on a closed root client is allowed: the channel then delivers
+   :opening / :open when open! is called on it (close it yourself if the
+   reopen never comes). The channel closes after {:event :closed} (close!
+   of the client or its root), and closing it yourself (core.async/close!) unsubscribes: the
+   listeners are removed at the next event, when a parked put notices, or
+   within util/cancel-poll-ms while idle (open-resources counts live
+   subscriptions). While a subscription is live a cancel-poll timer ticks,
+   so close the channel or the client before expecting the process to
+   exit. Events are queued without bound while the consumer lags (a write
+   cannot be held back). A subscription does not survive a reopen.
+   opts: :buffer (default 32), :only (set of event-names). Never throws:
+   an argument-error arrives as the channel's only item, then it closes."
+  [c & [opts]]
+  (let [opts (util/normalize-opts opts)
+        buffer (get opts :buffer 32)
+        ch (async/chan (if (and (integer? buffer) (pos? buffer)) buffer 32))]
+    (try
+      (check-client! :events c)
+      (util/check-opts! :events events-options opts)
+      (when-not (and (integer? buffer) (pos? buffer))
+        (throw (util/argument-error "events!: :buffer must be a positive integer"
+                                    {:arg :buffer :value buffer :op :events})))
+      (let [only (:only opts)
+            _ (when (and (some? only) (not (and (set? only) (every? event-names only))))
+                (throw (util/argument-error (str "events!: :only must be a set of " (pr-str (vec (sort event-names))))
+                                            {:arg :only :value only :op :events})))
+            db (run-sync :events #(js-db c))
+            queue (atom cljs.core/PersistentQueue.EMPTY)
+            signal (async/chan (async/dropping-buffer 1))
+            released? (atom false)
+            push! (fn [ev] (swap! queue conj ev) (async/offer! signal true))
+            listeners (into {}
+                            (map (fn [n]
+                                   [n (case n
+                                        "write" (fn [ops] (push! (write->event c ops)))
+                                        "clear" (fn [jo] (push! (clear->event c jo)))
+                                        (fn [] (push! {:event (keyword n)})))]))
+                            upstream-events)
+            release! (fn []
+                       (when (compare-and-set! released? false true)
+                         (doseq [[n f] listeners] (js-invoke db "off" n f))
+                         (untrack! c :subscription ch)))]
+        (doseq [[n f] listeners] (js-invoke db "on" n f))
+        (track! c :subscription ch)
+        (events-loop! ch queue signal only release!))
+      (catch :default e
+        (async/put! ch (->error :events e))
+        (async/close! ch)))
+    ch))
 
 ;; ---------------------------------------------------------------------------
 ;; bytes helpers (inventory 9.14): opaque byte values without interop

@@ -9,8 +9,11 @@
    interop and therefore lives in the single binding namespace
    (leveldb-cljs.binding, Phase 2); this namespace only deals in strings,
    keywords and maps. Phase 2 adds range-option normalisation and codec
-   descriptors here (inventory §13)."
-  (:require [clojure.string :as str]))
+   descriptors here (inventory §13); Phase 4 adds the one core.async helper
+   shared by the iterator and event channels (`put-or-cancel!`)."
+  (:require [clojure.string :as str]
+            [cljs.core.async :as async :refer [alts! go-loop]]
+            [cljs.core.async.impl.protocols :as impl]))
 
 ;; ---------------------------------------------------------------------------
 ;; kebab-case <-> camelCase (inventory 13.1: abstract-level options, the
@@ -242,3 +245,32 @@
       (throw (argument-error (str "batch op " idx ": :put needs a :value") {:arg :ops :index idx})))
     (check-opts! :batch #{:type :key :value :key-encoding :value-encoding :sublevel} op)
     op))
+
+;; ---------------------------------------------------------------------------
+;; Phase 4: the cancel-poll put shared by leveldb-cljs.iter and the events
+;; channel of leveldb-cljs.core (inventory 10.4). core.async is pure
+;; ClojureScript, so this stays within the no-interop rule of this namespace.
+;; ---------------------------------------------------------------------------
+
+(def cancel-poll-ms
+  "How long a parked put waits before re-checking whether the consumer
+   closed the channel (core.async: closing a channel does not wake parked
+   puts, so a producer parked on a full buffer must poll)."
+  100)
+
+(defn chan-closed?
+  "True when core.async channel `ch` has been closed."
+  [ch]
+  (impl/closed? ch))
+
+(defn put-or-cancel!
+  "Puts `v` on `ch`; returns a channel yielding true when delivered, false
+   when the consumer closed `ch` (checked immediately and then on every
+   cancel-poll-ms tick while the put is parked)."
+  [ch v]
+  (go-loop []
+    (let [[res port] (alts! [[ch v] (async/timeout cancel-poll-ms)])]
+      (cond
+        (identical? port ch) (boolean res)
+        (impl/closed? ch) false
+        :else (recur)))))
