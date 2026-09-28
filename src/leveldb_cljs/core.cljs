@@ -5,10 +5,10 @@
    kebab-case keyword maps, promesa promises for every I/O operation,
    opaque record handles for databases, iterators, chained batches and
    snapshots. leveldb-cljs.iter builds core.async channels on top of the
-   iterator handles defined here; the events channel (`events!`, inventory
-   §6) lives in this namespace because subscribing is interop.
+   iterator handles defined here; the events channel (`events!`) lives in
+   this namespace because subscribing is interop.
 
-   Conventions (inventory §11):
+   Conventions:
    - names ending in `!` perform I/O and return a promise, except the
      documented synchronous ones (`get-sync`, `it-seek!`, `batch-put!`,
      `batch-del!`, `batch-clear!`), which return a value and throw;
@@ -31,8 +31,7 @@
    and every sublevel, iterator, batch and snapshot. Reopening (`open!` on
    a closed client) bumps an open generation; sublevel clients re-derive
    their upstream handle lazily when the generation changed (upstream
-   sublevel handles stay closed forever after a parent close, inventory
-   9.13)."
+   sublevel handles stay closed forever after a parent close)."
   (:require [clojure.string :as str]
             [cljs.core.async :as async :refer [<! alts! go-loop]]
             [promesa.core :as p]
@@ -40,7 +39,7 @@
             [leveldb-cljs.util :as util]))
 
 ;; ---------------------------------------------------------------------------
-;; error normalization (inventory 10.5)
+;; error normalization
 ;; ---------------------------------------------------------------------------
 
 (defn- js-prop
@@ -51,7 +50,7 @@
       (when-not (undefined? v) v))))
 
 (defn- open-failure-reason
-  "Heuristic (inventory 9.4) for :database-not-open errors: :locked /
+  "Heuristic for :database-not-open errors: :locked /
    :missing / :exists / :io / nil, from the cause code or message text."
   [cause-code cause-message]
   (cond
@@ -272,7 +271,7 @@
 ;; ---------------------------------------------------------------------------
 
 (defn- load-ctor
-  "Lazily requires the backend module (pitfall 8.18) and returns its
+  "Lazily requires the backend module and returns its
    constructor."
   [backend]
   (case backend
@@ -339,7 +338,7 @@
              (p/then (js-invoke db "open")
                      (fn [_]
                        ;; a real reopen invalidates every sublevel handle (they stay
-                       ;; closed upstream, inventory 9.13); an idempotent open! on an
+                       ;; closed upstream); an idempotent open! on an
                        ;; open root must not churn handles
                        (when-not was-open?
                          (swap! (:state r) update :generation inc))
@@ -452,7 +451,7 @@
 (defn get-sync
   "Synchronous `get!`: returns the decoded value or nil, throws normalized
    errors. CAVEAT: this BLOCKS THE NODE EVENT LOOP for the duration of the
-   LevelDB read (upstream `getSync`, inventory 9.15) — nothing else runs
+   LevelDB read (upstream `getSync`) — nothing else runs
    meanwhile. Faster than get! for small hot reads; never use it in a
    request path that must stay responsive. Same opts as get!."
   [c key & [opts]]
@@ -547,7 +546,7 @@
 
 (defn- op-sublevel!
   "Validates the :sublevel of a batch op: a sublevel client sharing the root
-   of `c` (upstream silently loses writes to a foreign root, inventory 9.2).
+   of `c` (upstream silently loses writes to a foreign root).
    Returns the sublevel client or nil."
   [op c s]
   (when (some? s)
@@ -606,7 +605,7 @@
 (defn clear!
   "Deletes every entry, or the range selected by :gt / :gte / :lt / :lte
    (encoded with the key codec), :limit (with :reverse: the LAST n),
-   :key-encoding, :snapshot. NOT ATOMIC (inventory 9.18): a concurrent
+   :key-encoding, :snapshot. NOT ATOMIC: a concurrent
    writer may interleave; iterate keys into a batch! when atomicity matters.
    Resolves nil."
   [c & [opts]]
@@ -619,7 +618,7 @@
            (p/then (js-invoke (js-db c) "clear" jo) (constantly nil))))))
 
 ;; ---------------------------------------------------------------------------
-;; sublevels (inventory 2.7, 9.13)
+;; sublevels
 ;; ---------------------------------------------------------------------------
 
 (defn sublevel
@@ -660,7 +659,7 @@
     (run-sync :path #(vec (array-seq (js-invoke (js-db c) "path" (boolean local?)))))))
 
 ;; ---------------------------------------------------------------------------
-;; snapshots (inventory 2.8)
+;; snapshots
 ;; ---------------------------------------------------------------------------
 
 (defn snapshot
@@ -701,7 +700,7 @@
                (p/catch (fn [e] (p/then (close-snapshot! s) (fn [_] (throw e))))))))))
 
 ;; ---------------------------------------------------------------------------
-;; chained batch (inventory 5.6, §11.4)
+;; chained batch
 ;; ---------------------------------------------------------------------------
 
 (defn chained-batch
@@ -818,7 +817,7 @@
                           (p/then (batch-close! b) (fn [_] (throw e))))))))))
 
 ;; ---------------------------------------------------------------------------
-;; iterators (inventory 2.5, 5.x) — handles for leveldb-cljs.iter
+;; iterators — handles for leveldb-cljs.iter
 ;; ---------------------------------------------------------------------------
 
 (defn- iterator-opts!
@@ -961,7 +960,7 @@
   (boolean (:open? @(:state it))))
 
 ;; ---------------------------------------------------------------------------
-;; convenience readers (inventory §11.3 all!/keys!/values!)
+;; convenience readers (all!/keys!/values!)
 ;; ---------------------------------------------------------------------------
 
 (defn all!
@@ -982,7 +981,7 @@
   (run :values (fn [] (it-all! (value-iterator c opts)))))
 
 ;; ---------------------------------------------------------------------------
-;; events (inventory §6): the upstream EventEmitter surface as a core.async
+;; events: the upstream EventEmitter surface as a core.async
 ;; channel. abstract-level 3 emits opening / open / closing / closed (no
 ;; args), write (an array of normalized ops: put / del / batch / chained
 ;; write) and clear (the options object); the legacy put / del / batch
@@ -1006,8 +1005,8 @@
    client's codec. Upstream hands back the ORIGINAL input of the write (a
    string for the utf8-format codecs, bytes for the buffer ones), except
    that writes made through a sublevel reach the parent already prefixed
-   and encoded (bytes on memory-level, strings on classic-level, pitfall
-   8.15): bytes are turned into text for a utf8-format codec so both
+   and encoded (bytes on memory-level, strings on classic-level): bytes
+   are turned into text for a utf8-format codec so both
    backends report the same thing. Returns [value decode-error]; a decode
    failure (a sublevel's non-EDN text under an :edn root, for instance)
    yields the raw value plus the codec-error instead of killing the
@@ -1094,7 +1093,7 @@
             (recur))))))
 
 (defn events!
-  "A core.async channel of the client's upstream events (inventory §6), in
+  "A core.async channel of the client's upstream events, in
    emission order:
      {:event :opening} {:event :open} {:event :closing} {:event :closed}
      {:event :put :key k :value v [:sublevel true]}
@@ -1111,7 +1110,7 @@
    :key is then the prefixed key; upstream drops the sublevel reference
    before emitting, so the prefix itself is only recoverable from the key).
    Writes through a sublevel client also reach the parent's channel with
-   the prefixed key and the raw stored value (pitfall 8.10); subscribe on
+   the prefixed key and the raw stored value; subscribe on
    the sublevel client to see its own keys. A decode failure adds
    :decode-error (the ex-info) and keeps the raw value.
    Subscribing on a closed root client is allowed: the channel then delivers
@@ -1165,7 +1164,7 @@
     ch))
 
 ;; ---------------------------------------------------------------------------
-;; bytes helpers (inventory 9.14): opaque byte values without interop
+;; bytes helpers: opaque byte values without interop
 ;; ---------------------------------------------------------------------------
 
 (def bytes?

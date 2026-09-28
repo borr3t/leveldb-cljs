@@ -1,5 +1,5 @@
 (ns leveldb-cljs.iter
-  "Iterators as core.async channels (inventory 10.4, §11.5). Pure
+  "Iterators as core.async channels. Pure
    ClojureScript: uses only leveldb-cljs.core handles and core.async.
 
    (entries! c opts) / (keys! c opts) / (values! c opts) return a channel
@@ -7,7 +7,7 @@
    key order, then closes. Reads are lazy and backpressured: the producer
    fetches :batch-size items per upstream read (default 100) and parks
    when the channel buffer (:buffer, default 32) is full, so at most one
-   upstream read is ever in flight per iterator (inventory 5.1).
+   upstream read is ever in flight per iterator.
 
    Errors: an error (a leveldb-cljs ex-info: db-error / codec-error /
    argument-error) is put on the channel as its LAST item, then the channel
@@ -18,11 +18,11 @@
    iteration: the producer notices at its next put (immediately when it is
    parked on a full buffer, otherwise within `cancel-poll-ms`) and closes
    the upstream iterator, so nothing leaks (verify with
-   core/open-resources). Abort signals are not exposed (inventory 9.5).
+   core/open-resources). Abort signals are not exposed.
 
    seek is deliberately NOT available on a channel: the upstream iterator
    is busy whenever a read is in flight and `seek` then throws
-   :iterator-busy (inventory 5.1); use core/iterator + core/it-seek! for
+   :iterator-busy; use core/iterator + core/it-seek! for
    manual positioning."
   (:require [cljs.core.async :as async :refer [<! go-loop]]
             [promesa.core :as p]

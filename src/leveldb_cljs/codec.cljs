@@ -1,12 +1,12 @@
 (ns leveldb-cljs.codec
-  "Keyword-selectable value/key codecs (inventory §4.7, §11.2).
+  "Keyword-selectable value/key codecs.
 
    Codec discipline: every key and value leaves leveldb-cljs.core ALREADY
    ENCODED into the upstream store format (a string for `:format :utf8`,
    opaque bytes for `:format :buffer` / `:format :view`), and every raw
    read is decoded here before the caller sees it. Upstream therefore only
    ever receives its 'utf8' / 'buffer' / 'view' encodings and can never
-   stringify a CLJS value silently (pitfall 8.4): a non-string under
+   stringify a CLJS value silently: a non-string under
    `:utf8` is a :leveldb-cljs/codec-error, not \"[object Object]\".
 
    Builtin codecs:
@@ -59,7 +59,7 @@
 ;; ---------------------------------------------------------------------------
 
 (def formats
-  "The three store formats abstract-level accepts (inventory 4.3)."
+  "The three store formats abstract-level accepts."
   #{:utf8 :buffer :view})
 
 (def format->upstream
@@ -92,7 +92,7 @@
   "CLJS data <-> EDN text via pr-str / cljs.reader/read-string (the EDN
    reader: no code evaluation). Exact round-trip for all EDN data.
    Options: {:readers {'my/tag f}} for custom tagged literals, {:default f}
-   for unknown tags. Recommended for CLJS values (inventory 9.12)."
+   for unknown tags. Recommended for CLJS values."
   ([] (edn-codec nil))
   ([{:keys [readers default]}]
    (let [opts (cond-> {:eof ::eof}
@@ -198,7 +198,7 @@
   "Validates `v` for `codec` before any upstream call: nil is an
    argument-error (LEVEL_INVALID_KEY / LEVEL_INVALID_VALUE would follow),
    a value the codec's :check rejects is a codec-error (the silent-stringify
-   guard, pitfall 8.4). `role` is :key or :value for the error data. Returns v."
+   guard). `role` is :key or :value for the error data. Returns v."
   ([codec v] (check-value! codec v :value))
   ([codec v role]
    (when (nil? v)

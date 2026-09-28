@@ -7,16 +7,16 @@
    Pure: no I/O and no JavaScript interop. Converting CLJS maps to JS option
    objects (and reading `code`/`message`/`cause` off a thrown JS error) is
    interop and therefore lives in the single binding namespace
-   (leveldb-cljs.binding, Phase 2); this namespace only deals in strings,
-   keywords and maps. Phase 2 adds range-option normalisation and codec
-   descriptors here (inventory §13); Phase 4 adds the one core.async helper
-   shared by the iterator and event channels (`put-or-cancel!`)."
+   (leveldb-cljs.core); this namespace only deals in strings, keywords and
+   maps. It also holds the option normalisation and validation shared by
+   the operations, and the one core.async helper shared by the iterator and
+   event channels (`put-or-cancel!`)."
   (:require [clojure.string :as str]
             [cljs.core.async :as async :refer [alts! go-loop]]
             [cljs.core.async.impl.protocols :as impl]))
 
 ;; ---------------------------------------------------------------------------
-;; kebab-case <-> camelCase (inventory 13.1: abstract-level options, the
+;; kebab-case <-> camelCase (abstract-level options, the
 ;; db.supports manifest and `write` event operation objects are camelCase)
 ;; ---------------------------------------------------------------------------
 
@@ -63,7 +63,7 @@
 
 (def option-passthrough-keys
   "Kebab keys whose subtree is handed to abstract-level verbatim: user data
-   and opaque upstream objects (inventory 13.1)."
+   and opaque upstream objects."
   #{:value :key :gt :gte :lt :lte :snapshot :sublevel :signal})
 
 (defn ->camel-keys
@@ -83,7 +83,7 @@
   (transform-keys camel->kebab x))
 
 ;; ---------------------------------------------------------------------------
-;; Upstream error codes (inventory §9: LEVEL_* codes are the semver contract)
+;; Upstream error codes (LEVEL_* codes are the semver contract)
 ;; ---------------------------------------------------------------------------
 
 (defn level-code->keyword
@@ -114,9 +114,9 @@
   #{:leveldb-cljs/db-error :leveldb-cljs/argument-error :leveldb-cljs/codec-error})
 
 (defn db-error
-  "ex-info for an error raised by abstract-level / classic-level (inventory
-   §9). `code` is the upstream LEVEL_* string or its keyword form; `message`
-   the upstream message. Data: {:type :leveldb-cljs/db-error :code <kebab
+  "ex-info for an error raised by abstract-level / classic-level. `code`
+   is the upstream LEVEL_* string or its keyword form; `message` the
+   upstream message. Data: {:type :leveldb-cljs/db-error :code <kebab
    keyword or nil> :message .. :cause <original error, if any> ..}."
   [code message & [data]]
   (let [code (level-code->keyword code)]
@@ -133,8 +133,8 @@
            (merge {:type :leveldb-cljs/argument-error} data)))
 
 (defn codec-error
-  "ex-info for an encode/decode failure inside a leveldb-cljs codec (the
-   :edn / :transit value codecs of Phase 2). Upstream decode failures keep
+  "ex-info for an encode/decode failure inside a leveldb-cljs codec
+   (leveldb-cljs.codec). Upstream decode failures keep
    :leveldb-cljs/db-error with :code :decode-error."
   [message & [data]]
   (ex-info (str "leveldb-cljs codec: " message)
@@ -166,7 +166,7 @@
   (contains? not-open-codes (error-code e)))
 
 ;; ---------------------------------------------------------------------------
-;; Phase 2 additions (inventory §11.7): option-key normalisation, per-method
+;; Options: option-key normalisation, per-method
 ;; option whitelists, range-option normalisation, batch-op normalisation.
 ;; ---------------------------------------------------------------------------
 
@@ -208,7 +208,7 @@
   #{:gt :gte :lt :lte})
 
 (defn check-limit!
-  "Validates `:limit` (inventory 5.4): nil -> unlimited (dropped), -1 ->
+  "Validates `:limit`: nil -> unlimited (dropped), -1 ->
    unlimited, 0 -> nothing, positive integer -> that many; anything else is
    an argument-error. Returns the normalised opts."
   [op opts]
@@ -225,7 +225,7 @@
   (contains? #{:put :del} t))
 
 (defn normalize-op
-  "Validates the shape of one batch operation map (pitfall 8.1/8.19):
+  "Validates the shape of one batch operation map:
    :type must be :put or :del, :key must be present, :put needs :value, only
    the keys #{:type :key :value :key-encoding :value-encoding :sublevel} are
    allowed. Returns the op (with `?`-less keys). Throws argument-error.
@@ -247,8 +247,8 @@
     op))
 
 ;; ---------------------------------------------------------------------------
-;; Phase 4: the cancel-poll put shared by leveldb-cljs.iter and the events
-;; channel of leveldb-cljs.core (inventory 10.4). core.async is pure
+;; The cancel-poll put shared by leveldb-cljs.iter and the events
+;; channel of leveldb-cljs.core. core.async is pure
 ;; ClojureScript, so this stays within the no-interop rule of this namespace.
 ;; ---------------------------------------------------------------------------
 
